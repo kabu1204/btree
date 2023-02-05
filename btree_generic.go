@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build go1.18
-// +build go1.18
+//go:build ignore
+// +build ignore
 
 // In Go 1.18 and beyond, a BTreeG generic is created, and BTree is a specific
 // instantiation of that generic for the Item interface, with a backwards-

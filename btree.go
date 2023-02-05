@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !go1.18
-// +build !go1.18
-
 // Package btree implements in-memory B-Trees of arbitrary degree.
 //
 // btree implements an in-memory B-Tree for use as an ordered data structure.
@@ -242,8 +239,11 @@ func (s *children) truncate(index int) {
 // node is an internal node in a tree.
 //
 // It must at all times maintain the invariant that either
-//   * len(children) == 0, len(items) unconstrained
-//   * len(children) == len(items) + 1
+//  leaf:     * len(children) == 0, len(items) unconstrained
+//  internal: * len(children) == len(items) + 1
+//
+// some reminders:
+// children[i] < items[i]
 type node struct {
 	items    items
 	children children
@@ -255,6 +255,7 @@ func (n *node) mutableFor(cow *copyOnWriteContext) *node {
 		return n
 	}
 	out := cow.newNode()
+	// to make len and cap of out.items equal to len and cap of n.items
 	if cap(out.items) >= len(n.items) {
 		out.items = out.items[:len(n.items)]
 	} else {
@@ -273,13 +274,29 @@ func (n *node) mutableFor(cow *copyOnWriteContext) *node {
 
 func (n *node) mutableChild(i int) *node {
 	c := n.children[i].mutableFor(n.cow)
-	n.children[i] = c
+	n.children[i] = c // is this atomic?
 	return c
 }
 
 // split splits the given node at the given index.  The current node shrinks,
 // and this function returns the item that existed at that index and a new node
 // containing all items/children after it.
+//
+// next.items = n.items[i+1:]
+// n.items = n.items[:i]
+//
+// e.g. i=2
+// before:
+//     [i0 | i1 | i2 | i3]
+//    /    |    |    |    \
+//   /     |    |    |     \
+//  c0    c1   c2    c3    c4
+//
+// after:
+//     [i0 | i1]     i2     [i3]
+//    /    |    \          /    \
+//   /     |     \        /      \
+//  c0    c1     c2      c3      c4
 func (n *node) split(i int) (Item, *node) {
 	item := n.items[i]
 	next := n.cow.newNode()
@@ -294,6 +311,19 @@ func (n *node) split(i int) (Item, *node) {
 
 // maybeSplitChild checks if a child should be split, and if so splits it.
 // Returns whether or not a split occurred.
+//
+// e.g. i=2
+// before:
+//     [i0 | i1 | i2 | i3]
+//    /    |    |    |    \
+//   /     |    |    |     \
+//  c0    c1   c2    c3    c4
+//
+// after:
+//     [i0 | i1 | item |  i2  | i3]
+//    /    |    |      |      |    \
+//   /     |    |      |      |     \
+//  c0    c1  first  second   c3    c4
 func (n *node) maybeSplitChild(i, maxItems int) bool {
 	if len(n.children[i].items) < maxItems {
 		return false
@@ -308,8 +338,25 @@ func (n *node) maybeSplitChild(i, maxItems int) bool {
 // insert inserts an item into the subtree rooted at this node, making sure
 // no nodes in the subtree exceed maxItems items.  Should an equivalent item be
 // be found/replaced by insert, it will be returned.
+//
+// 1. for leaf, insert directly into this node,
+// 2. for internal, try to insert into children[i]
+//   a) if children[i] is non-full:
+//        insert into children[i]
+//   b) if children[i] is full:
+//        split n.children[i]:
+//
+//			         n:      [i0 | i1 | inTree |  i2  | i3]
+//				            /    |    |        |      |    \
+//				           /     |    |        |      |     \
+//		    n.children:   c0    c1  first   second   c3     c4
+//
+//        if item < inTree:
+//          insert into first
+//        else:
+//          insert into second
 func (n *node) insert(item Item, maxItems int) Item {
-	i, found := n.items.find(item)
+	i, found := n.items.find(item) // if !found: items[i-1] < item < items[i]
 	if found {
 		out := n.items[i]
 		n.items[i] = item
@@ -320,7 +367,7 @@ func (n *node) insert(item Item, maxItems int) Item {
 		return nil
 	}
 	if n.maybeSplitChild(i, maxItems) {
-		inTree := n.items[i]
+		inTree := n.items[i] // first < inTree < second
 		switch {
 		case item.Less(inTree):
 			// no change, we want first split node
@@ -400,6 +447,7 @@ func (n *node) remove(item Item, minItems int, typ toRemove) Item {
 		i = 0
 	case removeItem:
 		i, found = n.items.find(item)
+		// what if found for an internal node?
 		if len(n.children) == 0 {
 			if found {
 				return n.items.removeAt(i)
@@ -424,6 +472,11 @@ func (n *node) remove(item Item, minItems int, typ toRemove) Item {
 		// We use our special-case 'remove' call with typ=maxItem to pull the
 		// predecessor of item i (the rightmost leaf of our immediate left child)
 		// and set it into where we pulled the item from.
+		// e.g. i=2
+		//			     n:      [i0 | i1 | c2.max | i3 ]
+		//			            /    |    |        |     \
+		//			           /     |    |        |      \
+		//		n.children:   c0    c1   c2-max    c3     c4
 		n.items[i] = child.remove(nil, minItems, removeMax)
 		return out
 	}
@@ -454,6 +507,20 @@ func (n *node) remove(item Item, minItems int, typ toRemove) Item {
 func (n *node) growChildAndRemove(i int, item Item, minItems int, typ toRemove) Item {
 	if i > 0 && len(n.children[i-1].items) > minItems {
 		// Steal from left child
+		// e.g. i=2
+		// before:
+		//			     n:      [i0 | i1 | i2 ]
+		//			            /    |    |     \
+		//			           /     |    |      \
+		//		n.children:   c0    c1    c2     c3
+		//                                ↑
+		//
+		// after:
+		//			     n:      [i0 | c1.max | i2 ]
+		//			            /    |        |     \
+		//			           /     |        |      \
+		//		n.children:   c0    c1-max    c2+i1   c3
+		//                                    ↑
 		child := n.mutableChild(i)
 		stealFrom := n.mutableChild(i - 1)
 		stolenItem := stealFrom.items.pop()
@@ -478,6 +545,19 @@ func (n *node) growChildAndRemove(i int, item Item, minItems int, typ toRemove) 
 		}
 		child := n.mutableChild(i)
 		// merge with right child
+		// e.g. i=2
+		// before:
+		//			     n:      [i0 | i1 | i2 ]
+		//			            /    |    |     \
+		//			           /     |    |      \
+		//		n.children:   c0    c1    c2     c3
+		//                                ↑
+		//
+		// after:
+		//			     n:      [i0 | i1 ]
+		//			            /    |     \
+		//			           /     |      \
+		//		n.children:   c0    c1    {c2 | i2 | c3}
 		mergeItem := n.items.removeAt(i)
 		mergeChild := n.children.removeAt(i + 1)
 		child.items = append(child.items, mergeItem)
