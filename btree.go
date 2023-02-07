@@ -184,6 +184,12 @@ func (s *items) truncate(index int) {
 // find returns the index where the given item should be inserted into this
 // list.  'found' is true if the item already exists in the list at the given
 // index.
+// i.e. lower_bound
+// e.g. for a := items{4, 6, 8}
+// a.find(1) => [0, false]
+// a.find(4) => [0, true]
+// a.find(8) => [2, true]
+// a.find(9) => [3, false]
 func (s items) find(item Item) (index int, found bool) {
 	i := sort.Search(len(s), func(i int) bool {
 		return item.Less(s[i])
@@ -582,12 +588,34 @@ const (
 // will force the iterator to include the first item when it equals 'start',
 // thus creating a "greaterOrEqual" or "lessThanEqual" rather than just a
 // "greaterThan" or "lessThan" queries.
+//
+// param hit stands for whether we've encountered at least one valid (within
+// the range [start, stop) ) value during the iteration.
+//
+// e.g iterate over (2, 8):
+//                               root
+//		                 [  4  |   8   |  12  ]
+//			            /      |       |       \
+//			           /       |       |        \
+//		         [0|1|2]   [5|6|7]  [9|10|11]    [13|14]
+//                 c0         c1      c2           c3
+//
+// root.iterate(2, 8, false, false, iter)
+//   |-> c0.iterate(2, 8, false, false, iter) => return true, true
+//      |-> jump over value 2, hit = true
+//   |-> iter(4)
+//   |-> c1.iterate(2, 8, false, true, iter) => return true, true
+//      |-> iter(5)
+//      |-> iter(6)
+//      |-> iter(7)
 func (n *node) iterate(dir direction, start, stop Item, includeStart bool, hit bool, iter ItemIterator) (bool, bool) {
 	var ok, found bool
 	var index int
 	switch dir {
 	case ascend:
 		if start != nil {
+			// Note: index is the lower bound of start,
+			// i.e. the first element whose value >= start.
 			index, _ = n.items.find(start)
 		}
 		for i := index; i < len(n.items); i++ {
@@ -596,11 +624,20 @@ func (n *node) iterate(dir direction, start, stop Item, includeStart bool, hit b
 					return hit, false
 				}
 			}
+
+			/*
+				Because index is the lower bound of start (>=start),
+				in case we don't want to includeStart, if the first valid value <= start,
+				it should be jumped over and not be fed into user-defined iter function.
+				We then set hit to true, because there's no duplicated values in the tree, the
+				next value is always larger than start.
+			*/
 			if !includeStart && !hit && start != nil && !start.Less(n.items[i]) {
 				hit = true
 				continue
 			}
 			hit = true
+			// if n.items[i]>=stop, return immediately.
 			if stop != nil && !n.items[i].Less(stop) {
 				return hit, false
 			}
@@ -608,6 +645,7 @@ func (n *node) iterate(dir direction, start, stop Item, includeStart bool, hit b
 				return hit, false
 			}
 		}
+		// index>=len(n.items) OR stop > n.items[-1]
 		if len(n.children) > 0 {
 			if hit, ok = n.children[len(n.children)-1].iterate(dir, start, stop, includeStart, hit, iter); !ok {
 				return hit, false
